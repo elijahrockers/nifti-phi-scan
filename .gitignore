@@ -25,3 +25,8 @@ Thumbs.db
 *.log
 .pytest_cache/
 .ruff_cache/
+
+# NIfTI fixtures (regenerate with fixtures/create_test_fixtures.py)
+fixtures/*.nii
+fixtures/*.nii.gz
+fixtures/**/*.nii.gz

@@ -2,7 +2,9 @@
 
 import argparse
 import gc
+import json
 import logging
+import os
 import signal
 import sys
 from collections import defaultdict
@@ -30,6 +32,29 @@ def _is_nifti(path: Path) -> bool:
     if path.suffixes[-2:] == [".nii", ".gz"]:
         return True
     return path.suffix == ".nii"
+
+
+def _load_done_paths(output_file: str) -> set[str]:
+    """Read an existing JSONL output and return resolved paths already scanned."""
+    done: set[str] = set()
+    path = Path(output_file)
+    if not path.exists():
+        return done
+    with open(path) as f:
+        for line_no, line in enumerate(f, 1):
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                record = json.loads(line)
+                raw_path = record.get("filepath", "")
+                if raw_path:
+                    done.add(os.path.realpath(raw_path))
+            except json.JSONDecodeError:
+                logger.warning(
+                    "Skipping corrupted line %d in %s", line_no, output_file,
+                )
+    return done
 
 
 def _collect_files(
@@ -216,9 +241,21 @@ def _scan_single(filepath: str, output_file: str | None, timeout: int | None = N
 
 def _scan_batch(
     files: list[Path], source: str, output_file: str | None, verbose: bool,
-    timeout: int | None = None,
+    timeout: int | None = None, resume: bool = False,
 ) -> int:
     """Scan multiple files, print per-file findings and aggregate summary, write JSONL."""
+    if resume and output_file:
+        done_paths = _load_done_paths(output_file)
+        if done_paths:
+            original_count = len(files)
+            files = [f for f in files if os.path.realpath(str(f)) not in done_paths]
+            skipped = original_count - len(files)
+            total = len(files)
+            print(f"Resume: {skipped} files already in output, {total} remaining")
+            if total == 0:
+                print("Nothing left to scan.")
+                return 0
+
     total = len(files)
     print(f"\nScanning {total} files in {source} ...")
     if output_file:
@@ -236,7 +273,8 @@ def _scan_batch(
     total_header_findings = 0
     total_pixel_findings = 0
 
-    out = open(output_file, "w") if output_file else None  # noqa: SIM115
+    mode = "a" if resume else "w"
+    out = open(output_file, mode) if output_file else None  # noqa: SIM115
     try:
         for i, filepath in enumerate(files, 1):
             short_path = f"{filepath.parent.name}/{filepath.name}"
@@ -259,6 +297,7 @@ def _scan_batch(
                 if out:
                     error = FileError(filepath=str(filepath), error=str(exc))
                     out.write(error.model_dump_json() + "\n")
+                    out.flush()
                 gc.collect()
                 continue
 
@@ -268,6 +307,7 @@ def _scan_batch(
             # Stream to JSONL
             if out:
                 out.write(report.model_dump_json() + "\n")
+                out.flush()
 
             # Accumulate stats
             risk_counts[report.risk_level.value] += 1
@@ -317,6 +357,7 @@ def main():
             "  nifti-phi-scan brain.nii.gz -o report.json\n"
             "  nifti-phi-scan --dir ./dataset -o results.jsonl\n"
             "  nifti-phi-scan --manifest files.txt --chunk-size 100 --chunk-index 0 -o out.jsonl\n"
+            "  nifti-phi-scan --dir ./dataset -o results.jsonl --resume\n"
             "\n"
             "query the JSONL report:\n"
             "  jq 'select(.risk_level == \"high\") | .filepath' results.jsonl\n"
@@ -349,6 +390,8 @@ def main():
                         help="Per-file timeout in seconds (default: no timeout)")
     parser.add_argument("--cpu", action="store_true",
                         help="Force CPU for OCR even if GPU is available")
+    parser.add_argument("--resume", action="store_true",
+                        help="Resume interrupted batch scan; skip files already in output JSONL")
     parser.add_argument("-v", "--verbose", action="store_true",
                         help="Verbose logging")
 
@@ -365,6 +408,13 @@ def main():
         parser.error("Provide a filepath, --dir, or --manifest")
     if modes > 1:
         parser.error("Specify only one of: filepath, --dir, --manifest")
+
+    # Validate --resume
+    if args.resume:
+        if not args.output_file:
+            parser.error("--resume requires -o/--output")
+        if args.filepath:
+            parser.error("--resume is only supported in batch mode (--dir or --manifest)")
 
     # Initialize OCR reader
     init_reader(gpu=False if args.cpu else None)
@@ -396,5 +446,7 @@ def main():
         logger.warning("No NIfTI files found")
         sys.exit(0)
 
-    exit_code = _scan_batch(files, source, args.output_file, args.verbose, args.timeout)
+    exit_code = _scan_batch(
+        files, source, args.output_file, args.verbose, args.timeout, args.resume,
+    )
     sys.exit(exit_code)
